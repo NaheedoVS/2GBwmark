@@ -1,117 +1,89 @@
 import os
 import logging
-from telegram import Update
-from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, filters
-from telegram.request import HTTPXRequest
-from moviepy.editor import VideoFileClip, TextClip, CompositeVideoClip
-import tempfile
+import subprocess
+from pyrogram import Client, filters
+from pyrogram.types import Message
 
-# 1. SETUP LOGGING
+# 1. SETUP LOGGING (Kept from your old code)
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
+logger = logging.getLogger(name)
 
 # 2. CONFIGURATION
-TOKEN = os.getenv("TOKEN")
-WATERMARK_TEXT = "My Telegram Bot" # Change this to your desired text
+# To support 2GB, we need API_ID and API_HASH from https://my.telegram.org/
+# Add these to Heroku Config Vars
+API_ID = int(os.environ.get("API_ID", 0))
+API_HASH = os.environ.get("API_HASH", "")
+TOKEN = os.environ.get("TOKEN", "")
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await context.bot.send_message(
-        chat_id=update.effective_chat.id,
-        text="I am ready! Send me a video to watermark."
+# 3. INITIALIZE CLIENT (Pyrogram Engine)
+# This replaces ApplicationBuilder because this engine supports 2GB files.
+app = Client("my_bot", api_id=API_ID, api_hash=API_HASH, bot_token=TOKEN)
+
+@app.on_message(filters.command("start"))
+async def start(client, message):
+    await message.reply_text(
+        "Bot is Online! Send me a video up to 2GB."
     )
 
-async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    status_msg = await context.bot.send_message(chat_id=chat_id, text="Video received. Downloading...")
+@app.on_message(filters.video)
+async def handle_video(client, message: Message):
+    chat_id = message.chat.id
+    
+    # Notify user
+    status_msg = await message.reply_text("Video received. Downloading (Supports 2GB)...")
     
     input_path = f"input_{chat_id}.mp4"
     output_path = f"output_{chat_id}.mp4"
 
     try:
         # --- DOWNLOAD ---
-        video_file = await update.message.video.get_file()
-        # Increased timeout allows large files to download without error
-        await video_file.download_to_drive(input_path)
+        # Pyrogram downloads large files efficiently
+        await message.download(file_name=input_path)
         
-        await context.bot.edit_message_text(
-            chat_id=chat_id, 
-            message_id=status_msg.message_id, 
-            text="Processing video... (This takes time)"
-        )
+        await status_msg.edit_text("Processing video... (Low-RAM Mode)")
 
-        # --- WATERMARK LOGIC (MoviePy) ---
-        # 1. Load Video
-        clip = VideoFileClip(input_path)
+        # --- PROCESS VIDEO (FFmpeg Subprocess) ---
+        # We run this outside Python to prevent memory crashes (The Fix)
+        command = [
+            'ffmpeg', '-y', 
+            '-i', input_path,
+            '-vf', "drawtext=text='My Telegram Bot':fontcolor=white:fontsize=30:x=20:y=20",
+            '-c:a', 'copy',          # Copy audio (fast)
+            '-preset', 'ultrafast',  # Crucial for Heroku speed
+            output_path
+        ]
         
-        # 2. Create Text Watermark
-        # Note: If this fails on Heroku, it's usually missing ImageMagick.
-        # We use a try/except for safety.
-        try:
-            txt_clip = TextClip(WATERMARK_TEXT, fontsize=50, color='white')
-            txt_clip = txt_clip.set_position(('center', 'bottom')).set_duration(clip.duration)
-            
-            # 3. Composite
-            video = CompositeVideoClip([clip, txt_clip])
-            
-            # 4. Write File (uses libx264 for compatibility)
-            video.write_videofile(output_path, codec="libx264", audio_codec="aac")
-            
-        except OSError as e:
-            # Fallback if ImageMagick is missing on server
-            logging.error(f"ImageMagick error: {e}")
-            await context.bot.send_message(chat_id=chat_id, text="Server config error: ImageMagick missing. Sending original.")
-            os.rename(input_path, output_path)
+        # Execute command
+        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        stdout, stderr = process.communicate()
+        
+        if process.returncode != 0:
+            raise Exception(f"FFmpeg Error: {stderr.decode()}")
+
+        await status_msg.edit_text("Uploading processed video...")
 
         # --- UPLOAD ---
-        await context.bot.edit_message_text(
-            chat_id=chat_id, 
-            message_id=status_msg.message_id, 
-            text="Uploading finished video..."
-        )
-        
-        await context.bot.send_video(
-            chat_id=chat_id,
-            video=open(output_path, 'rb'),
-            caption="Here is your watermarked video!"
+        await message.reply_video(
+            video=output_path, 
+            caption="Here is your video!"
         )
 
     except Exception as e:
-        logging.error(f"General Error: {e}")
-        await context.bot.send_message(chat_id=chat_id, text=f"Error: {str(e)}")
+        logger.error(f"Error: {e}")
+        await status_msg.edit_text(f"Error: {str(e)}")
 
     finally:
         # --- CLEANUP ---
-        # Close clips to release memory
-        try:
-            if 'clip' in locals(): clip.close()
-            if 'video' in locals(): video.close()
-        except:
-            pass
-            
-        # Remove files
         if os.path.exists(input_path): os.remove(input_path)
         if os.path.exists(output_path): os.remove(output_path)
 
-if name == 'main':
-    if not TOKEN:
-        print("Error: TOKEN not found in environment variables!")
+if name == "main":
+    if not TOKEN or not API_ID:
+        print("Error: API_ID, API_HASH, and TOKEN are required in Config Vars!")
         exit(1)
 
-    # --- THE NETWORK FIX ---
-    # Increases timeouts to prevent Heroku crashes
-    request_settings = HTTPXRequest(
-        connect_timeout=60.0,
-        read_timeout=60.0,
-        write_timeout=60.0,
-        pool_timeout=60.0
-    )
-
-    application = ApplicationBuilder().token(TOKEN).request(request_settings).build()
-
-    application.add_handler(CommandHandler('start', start))
-    application.add_handler(MessageHandler(filters.VIDEO, handle_video))
-
-    print("Bot is polling...")
-    application.run_polling()
+    print("Bot is starting polling...")
+    app.run()
