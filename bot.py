@@ -1,167 +1,117 @@
 import os
 import logging
-import asyncio
-import tempfile
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    ApplicationBuilder, 
-    ContextTypes, 
-    CommandHandler, 
-    MessageHandler, 
-    CallbackQueryHandler, # NEW
-    filters
-)
+from telegram import Update
+from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, filters
 from telegram.request import HTTPXRequest
+from moviepy.editor import VideoFileClip, TextClip, CompositeVideoClip
+import tempfile
 
-from config import Config
-from storage import db
-import watermark
-
+# 1. SETUP LOGGING
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
-logger = logging.getLogger(__name__)
+
+# 2. CONFIGURATION
+TOKEN = os.getenv("TOKEN")
+WATERMARK_TEXT = "My Telegram Bot" # Change this to your desired text
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "👋 **Video Watermark Bot**\n\n"
-        "Send a video (Max 2GB) to start.\n"
-        "Commands:\n"
-        "/setwatermark <text> - Change text\n"
-        "/setcolor - Change watermark color 🎨",
-        parse_mode='Markdown'
+    await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text="I am ready! Send me a video to watermark."
     )
-
-async def set_watermark_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if not context.args:
-        await update.message.reply_text("Usage: /setwatermark <text>")
-        return
-    text = " ".join(context.args)
-    db.set_watermark(user_id, text)
-    await update.message.reply_text(f"✅ Watermark set: `{text}`", parse_mode='Markdown')
-
-# --- NEW: COLOR MENU HANDLERS ---
-
-async def set_color_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Sends the color selection menu"""
-    keyboard = []
-    row = []
-    # Create buttons from Config.COLORS
-    for color_name in Config.COLORS.keys():
-        # Callback data is "color:Red", "color:Blue", etc.
-        btn = InlineKeyboardButton(f"🎨 {color_name}", callback_data=f"color:{color_name}")
-        row.append(btn)
-        if len(row) == 2: # 2 buttons per row
-            keyboard.append(row)
-            row = []
-    if row: keyboard.append(row)
-
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text("🎨 **Choose a color for your watermark:**", reply_markup=reply_markup, parse_mode='Markdown')
-
-async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles the button click"""
-    query = update.callback_query
-    await query.answer() # Acknowledge the click
-
-    data = query.data
-    if data.startswith("color:"):
-        color_name = data.split(":")[1]
-        user_id = query.from_user.id
-        
-        # Save to DB
-        db.set_color(user_id, color_name)
-        
-        await query.edit_message_text(f"✅ Color updated to **{color_name}**! 🎨", parse_mode='Markdown')
-
-# --------------------------------
 
 async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+    status_msg = await context.bot.send_message(chat_id=chat_id, text="Video received. Downloading...")
     
-    if update.message.video:
-        file_obj = update.message.video
-    elif update.message.document and 'video' in update.message.document.mime_type:
-        file_obj = update.message.document
-    else:
-        return
+    input_path = f"input_{chat_id}.mp4"
+    output_path = f"output_{chat_id}.mp4"
 
-    status_msg = await update.message.reply_text("⏳ Downloading 2GB+ capable stream...")
+    try:
+        # --- DOWNLOAD ---
+        video_file = await update.message.video.get_file()
+        # Increased timeout allows large files to download without error
+        await video_file.download_to_drive(input_path)
+        
+        await context.bot.edit_message_text(
+            chat_id=chat_id, 
+            message_id=status_msg.message_id, 
+            text="Processing video... (This takes time)"
+        )
 
-    with tempfile.TemporaryDirectory() as temp_dir:
+        # --- WATERMARK LOGIC (MoviePy) ---
+        # 1. Load Video
+        clip = VideoFileClip(input_path)
+        
+        # 2. Create Text Watermark
+        # Note: If this fails on Heroku, it's usually missing ImageMagick.
+        # We use a try/except for safety.
         try:
-            input_path = os.path.join(temp_dir, "input.mp4")
-            watermarked_path = os.path.join(temp_dir, "watermarked.mp4")
-            watermark_img = os.path.join(temp_dir, "wm.png")
-
-            new_file = await context.bot.get_file(file_obj.file_id)
-            await new_file.download_to_drive(input_path)
+            txt_clip = TextClip(WATERMARK_TEXT, fontsize=50, color='white')
+            txt_clip = txt_clip.set_position(('center', 'bottom')).set_duration(clip.duration)
             
-            await status_msg.edit_text("⚙️ Processing...")
-
-            # 1. Get User Preferences
-            user_text = db.get_watermark(user_id)
-            color_name = db.get_color(user_id)
+            # 3. Composite
+            video = CompositeVideoClip([clip, txt_clip])
             
-            # 2. Get RGB value from Config (Default to White if error)
-            color_rgb = Config.COLORS.get(color_name, (255, 255, 255))
+            # 4. Write File (uses libx264 for compatibility)
+            video.write_videofile(output_path, codec="libx264", audio_codec="aac")
+            
+        except OSError as e:
+            # Fallback if ImageMagick is missing on server
+            logging.error(f"ImageMagick error: {e}")
+            await context.bot.send_message(chat_id=chat_id, text="Server config error: ImageMagick missing. Sending original.")
+            os.rename(input_path, output_path)
 
-            # 3. Create Watermark (Passing the color now)
-            await asyncio.to_thread(watermark.create_text_watermark, user_text, watermark_img, color_rgb)
+        # --- UPLOAD ---
+        await context.bot.edit_message_text(
+            chat_id=chat_id, 
+            message_id=status_msg.message_id, 
+            text="Uploading finished video..."
+        )
+        
+        await context.bot.send_video(
+            chat_id=chat_id,
+            video=open(output_path, 'rb'),
+            caption="Here is your watermarked video!"
+        )
 
-            # 4. Process
-            await asyncio.to_thread(watermark.process_video, input_path, watermarked_path, watermark_img)
+    except Exception as e:
+        logging.error(f"General Error: {e}")
+        await context.bot.send_message(chat_id=chat_id, text=f"Error: {str(e)}")
 
-            # 5. Split & Upload
-            await status_msg.edit_text("⬆️ Uploading...")
-            final_files = await asyncio.to_thread(watermark.split_video, watermarked_path, temp_dir)
+    finally:
+        # --- CLEANUP ---
+        # Close clips to release memory
+        try:
+            if 'clip' in locals(): clip.close()
+            if 'video' in locals(): video.close()
+        except:
+            pass
+            
+        # Remove files
+        if os.path.exists(input_path): os.remove(input_path)
+        if os.path.exists(output_path): os.remove(output_path)
 
-            count = len(final_files)
-            for index, file_path in enumerate(final_files):
-                caption = f"Here is your video! ({color_name})"
-                if count > 1: caption = f"Part {index+1}/{count} ({color_name})"
-                
-                with open(file_path, 'rb') as f:
-                    await update.message.reply_video(
-                        video=f,
-                        caption=caption,
-                        read_timeout=Config.READ_TIMEOUT,
-                        write_timeout=Config.WRITE_TIMEOUT
-                    )
+if name == 'main':
+    if not TOKEN:
+        print("Error: TOKEN not found in environment variables!")
+        exit(1)
 
-            await status_msg.delete()
-
-        except Exception as e:
-            logger.error(f"Error: {e}")
-            await status_msg.edit_text("❌ Error processing video.")
-
-def main():
-    request = HTTPXRequest(
-        connect_timeout=Config.CONNECT_TIMEOUT,
-        read_timeout=Config.READ_TIMEOUT,
-        write_timeout=Config.WRITE_TIMEOUT
+    # --- THE NETWORK FIX ---
+    # Increases timeouts to prevent Heroku crashes
+    request_settings = HTTPXRequest(
+        connect_timeout=60.0,
+        read_timeout=60.0,
+        write_timeout=60.0,
+        pool_timeout=60.0
     )
 
-    application = (
-        ApplicationBuilder()
-        .token(Config.BOT_TOKEN)
-        .base_url(Config.BASE_URL) 
-        .request(request)
-        .build()
-    )
+    application = ApplicationBuilder().token(TOKEN).request(request_settings).build()
 
-    # Register Handlers
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("setwatermark", set_watermark_command))
-    application.add_handler(CommandHandler("setcolor", set_color_command)) # NEW
-    application.add_handler(CallbackQueryHandler(button_callback))         # NEW
-    
-    application.add_handler(MessageHandler(filters.VIDEO | filters.Document.VIDEO, handle_video))
+    application.add_handler(CommandHandler('start', start))
+    application.add_handler(MessageHandler(filters.VIDEO, handle_video))
 
-    print(f"Bot running on {Config.BASE_URL}...")
+    print("Bot is polling...")
     application.run_polling()
-
-if __name__ == '__main__':
-    main()
