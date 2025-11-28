@@ -25,10 +25,10 @@ class Config:
     DEFAULT_WATERMARK = "@WatermarkedBot"
     DEFAULT_COLOR = "White" # Default color name
     
-    FONT_SIZE = 40
+    FONT_SIZE = 36
     OPACITY = 200
-    MARGIN_X = 25
-    MARGIN_Y = 25
+    MARGIN_X = 20
+    MARGIN_Y = 20
     
     # --- NEW: AVAILABLE COLORS (Name: RGB Tuple) ---
     COLORS = {
